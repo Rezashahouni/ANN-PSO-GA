@@ -1,0 +1,241 @@
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.neural_network import MLPRegressor
+from pyswarm import pso
+from geneticalgorithm import geneticalgorithm as ga
+
+# Define weights for cost factors as global variables
+weights = {
+    'out_of_range': 0.1,
+    'overshoot': 0.6,
+    'error': 0.3,
+    'settling_time': 0.0
+}
+
+class NonLinearPIDController:
+    def __init__(self, setpoint):
+        self.setpoint = setpoint
+        self.integral = 0
+        self.previous_error = 0
+
+    def update(self, process_variable, dt, inlet_flow, temperature, pressure, Cd, A, rho):
+        error = self.setpoint - process_variable
+        self.integral += error * dt
+        derivative = (error - self.previous_error) / dt
+
+        # Gain scheduling based on error
+        a, b, c, d = 0.5, 0.3, 0.1, 0.05
+        Kp = (1.0 + a * np.exp(-abs(error))) / (1.0 + b * abs(error))
+        Ki = 0.1 * (1.0 + error**2 + c * abs(error))
+        Kd = 0.05 * (1.0 + d * np.sqrt(abs(error))) / (1.0 + abs(error))
+
+        # Incorporate dynamic parameters
+        delta_P = pressure - initial_pressure
+        orifice_flow = Cd * A * np.sqrt(2 * abs(delta_P) / rho)
+
+        flow_factor = 1.0 + (inlet_flow - initial_flow) * 0.01
+        temp_factor = 1.0 + (temperature - initial_temperature) * 0.01
+        pressure_factor = 1.0 + delta_P * 0.01
+
+        if inlet_flow < self.setpoint:
+            output = inlet_flow  # Cap the output to the inlet flow if it's less than the setpoint
+        else:
+            output = (
+                Kp * error + Ki * self.integral + Kd * derivative
+            ) * flow_factor * temp_factor * pressure_factor
+
+        self.previous_error = error
+        return output, orifice_flow
+
+
+# Simulation parameters
+time = np.linspace(0, 180, 5400)  # 3 hours, 5400 points
+dt = time[1] - time[0]
+
+# Define setpoints at different time intervals (in minutes)
+setpoints = np.piecewise(time, [time < 60, (time >= 60) & (time < 120), time >= 120], [8.0, 20.0, 30.0])
+
+# Initial fluid parameters
+initial_flow = 40  # ton/hr
+initial_temperature = 30  # degrees Celsius
+initial_pressure = 6  # bar
+Cd = 0.6  # Discharge coefficient
+A = 0.005  # Area of the orifice in square meters
+rho = 1000  # Density of the fluid in kg/m^3
+
+# Initialize Non-Linear PID controller with dummy values
+pid = NonLinearPIDController(setpoints[0])
+
+# Process variables
+process_variable = 0.0
+process_values = []
+current_setpoints = []
+inlet_flows = []
+temperatures = []
+pressures = []
+orifice_flows = []
+powers = []
+
+# ANN for PID tuning with 4 hidden layers, using MSE as the loss function and Adam optimizer
+ann = MLPRegressor(hidden_layer_sizes=(10, 10, 10, 10), max_iter=1000, solver='adam', alpha=0.0001)
+
+
+# PSO for PID tuning
+def objective(params):
+    global weights  # Use the global weights
+    Kp_base, Ki_base, Kd_base = params
+    pid = NonLinearPIDController(setpoints[0])
+    process_variable = 0.0
+    total_error_cost = 0.0
+    overshoot_cost = 0.0
+    settling_time_cost = 0.0
+    out_of_range_cost = 0.0
+    for t, sp in zip(time, setpoints):
+        inlet_flow = initial_flow + 2 * np.sin(0.1 * t)
+        temperature = initial_temperature + 5 * np.cos(0.1 * t)
+        pressure = initial_pressure + 1 * np.sin(0.05 * t)
+        power = inlet_flow * temperature * pressure  # Example power calculation
+        control_signal, orifice_flow = pid.update(process_variable, dt, inlet_flow, temperature, pressure, Cd, A, rho)
+        process_variable += control_signal * dt
+        error = sp - process_variable
+        total_error_cost += error ** 2
+
+        # Calculating overshoot cost
+        if process_variable > sp:
+            overshoot_cost += (process_variable - sp) ** 2
+
+        # Calculating settling time cost
+        if abs(error) > 0.05 * sp:
+            settling_time_cost += error ** 2
+
+        # Calculating out-of-range cost
+        if process_variable < 0 or process_variable > 2 * sp:
+            out_of_range_cost += (process_variable - sp) ** 2
+
+    # Combined cost function with weights
+    combined_cost = (
+        out_of_range_cost * weights['out_of_range'] +
+        overshoot_cost * weights['overshoot'] +
+        total_error_cost * weights['error'] +
+        settling_time_cost * weights['settling_time']
+    )
+    return combined_cost
+
+
+def optimize_pid(weights):
+    # Initial guess and bounds for PSO
+    initial_guess = [1.0, 0.1, 0.05]
+    bounds = ([0, 0, 0], [10, 1, 1])
+    optimal_params, _ = pso(objective, bounds[0], bounds[1], swarmsize=50, maxiter=100)
+    Kp_opt, Ki_opt, Kd_opt = optimal_params
+
+    # GA parameters
+    varbound = np.array([[0, 10], [0, 1], [0, 1]])
+    algorithm_param = {
+        'max_num_iteration': 100,
+        'population_size': 50,
+        'mutation_probability': 0.1,
+        'elit_ratio': 0.01,
+        'crossover_probability': 0.5,
+        'parents_portion': 0.3,
+        'crossover_type': 'uniform',
+        'max_iteration_without_improv': None
+    }
+    model = ga(function=objective, dimension=3, variable_type='real', variable_boundaries=varbound,
+               algorithm_parameters=algorithm_param)
+    model.run()
+    Kp_opt, Ki_opt, Kd_opt = model.output_dict['variable']
+
+    return Kp_opt, Ki_opt, Kd_opt
+
+
+# Define weights for cost factors
+weights = {
+    'out_of_range': 0.1,
+    'overshoot': 0.6,
+    'error': 0.3,
+    'settling_time': 0.0
+}
+
+# Optimize PID parameters
+Kp_opt, Ki_opt, Kd_opt = optimize_pid(weights)
+print(f"Optimized PID parameters: Kp={Kp_opt}, Ki={Ki_opt}, Kd={Kd_opt}")
+
+# Update Non-Linear PID controller with optimized parameters
+pid = NonLinearPIDController(setpoints[0])
+process_variable = 0.0
+process_values = []
+current_setpoints = []
+
+# Simulation loop with optimized PID
+for t, sp in zip(time, setpoints):
+    inlet_flow = initial_flow + 2 * np.sin(0.1 * t)
+    temperature = initial_temperature + 5 * np.cos(0.1 * t)
+    pressure = initial_pressure + 1 * np.sin(0.05 * t)
+    power = inlet_flow * temperature * pressure  # Example power calculation
+    pid.setpoint = sp
+    control_signal, orifice_flow = pid.update(process_variable, dt, inlet_flow, temperature, pressure, Cd, A, rho)
+    process_variable += control_signal * dt
+    process_values.append(process_variable)
+    current_setpoints.append(sp)
+    inlet_flows.append(inlet_flow)
+    temperatures.append(temperature)
+    pressures.append(pressure)
+    orifice_flows.append(orifice_flow)
+    powers.append(power)
+
+# Calculate tolerance and settling time
+tolerance = 0.05 * setpoints[-1]  # 5% tolerance
+
+## Plotting results
+plt.figure(figsize=(14, 15))
+
+# Plot Process Variable and Setpoint
+plt.subplot(6, 1, 1)
+plt.plot(time, process_values, label='Process Value')
+plt.plot(time, current_setpoints, label='Setpoint', linestyle='--')
+plt.axhline(setpoints[-1] + tolerance, color='r', linestyle='--', label='Upper Tolerance')
+plt.axhline(setpoints[-1] - tolerance, color='r', linestyle='--', label='Lower Tolerance')
+plt.ylabel('Process Value (ton/hr)')
+plt.title('Process Variable and Setpoint')
+plt.legend()
+plt.grid(True)
+
+# Plot Inlet Flow Over Time
+plt.subplot(6, 1, 2)
+plt.plot(time, inlet_flows, label='Inlet Flow')
+plt.ylabel('Inlet Flow (ton/hr)')
+plt.legend()
+plt.grid(True)
+
+# Plot Temperature Over Time
+plt.subplot(6, 1, 3)
+plt.plot(time, temperatures, label='Temperature (°C)')
+plt.ylabel('Temperature (°C)')
+plt.legend()
+plt.grid(True)
+
+# Plot Pressure Over Time
+plt.subplot(6, 1, 4)
+plt.plot(time, pressures, label='Pressure (bar)')
+plt.ylabel('Pressure (bar)')
+plt.legend()
+plt.grid(True)
+
+# Plot Orifice Flow Over Time
+plt.subplot(6, 1, 5)
+plt.plot(time, orifice_flows, label='Orifice Flow')
+plt.ylabel('Orifice Flow (m³/s)')
+plt.legend()
+plt.grid(True)
+
+# Plot Power Over Time
+plt.subplot(6, 1, 6)
+plt.plot(time, powers, label='Power')
+plt.xlabel('Time (min)')
+plt.ylabel('Power')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
